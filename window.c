@@ -9,6 +9,9 @@
 #include <string.h>
 #include <sys/time.h>
 #include <sys/resource.h>
+#include <X11/extensions/XShm.h>
+#include <sys/shm.h>
+#include <sys/ipc.h>
 
 
 typedef struct WinMeta {
@@ -63,62 +66,46 @@ void getStats(timing_t* timing) {
 }
 
 
-XImage* getScreenshotPixmap1234(Display* mainDspy, Window rootWin, Window mainWin, Pixmap finalPixmap, Picture finalPic) {
+XImage* getScreenshotPixmap1234(Display* dpy, Window rootWin, Window mainWin,
+                                 Pixmap finalPixmap, Picture finalPic,
+                                 XShmSegmentInfo* shminfo, XImage** shmImgPtr) {
 
-    int defaultScreen = DefaultScreen(mainDspy);
-    XWindowAttributes wa;
-    XGetWindowAttributes(mainDspy, mainWin, &wa);
-
+    int defaultScreen = DefaultScreen(dpy);
     Window returnedRoot, parent;
     Window* children;
     int numChildren;
-    XQueryTree(mainDspy, rootWin, &returnedRoot, &parent, &children, &numChildren);
+    XQueryTree(dpy, rootWin, &returnedRoot, &parent, &children, &numChildren);
 
-    Pixmap* openedWindows = (Pixmap*)malloc(sizeof(Pixmap) * numChildren);
-    XRenderPictFormat** formats = (XRenderPictFormat**)malloc(sizeof(XRenderPictFormat*) * numChildren);
-    
     WinMeta* meta = (WinMeta*)malloc(sizeof(WinMeta) * numChildren);
-    
-    int checkIndex = 0;
-    int openIndex = 0;
+    int checkIndex = 0, openIndex = 0;
     Bool isDone = False;
-    while (checkIndex < numChildren && !isDone) {// look over all children
 
-        //check if this is me(my window)
+    while (checkIndex < numChildren && !isDone) {
+        // check if this window contains mainWin
         Window rr, pp;
         Window* grandChildren;
         int numGrandchildren;
-        if (XQueryTree(mainDspy, children[checkIndex], &rr, &pp, &grandChildren, &numGrandchildren)) {
+        if (XQueryTree(dpy, children[checkIndex], &rr, &pp, &grandChildren, &numGrandchildren)) {
             for (int j = 0; j < numGrandchildren; j++) {
-                if (grandChildren[j] == mainWin) {
-                    isDone = True;
-                }
+                if (grandChildren[j] == mainWin) isDone = True;
             }
+            XFree(grandChildren);
         }
-        XFree(grandChildren);
 
-
-        // get the atricubes of the child window
         XWindowAttributes attr;
-        XGetWindowAttributes(mainDspy, children[checkIndex], &attr);
+        XGetWindowAttributes(dpy, children[checkIndex], &attr);
 
-        
-
-        //turn all valid children into pixmaps
         if (attr.map_state == IsViewable && !attr.override_redirect) {
-
             int rootX = 0, rootY = 0;
             Window tmp;
-            XTranslateCoordinates(mainDspy, children[checkIndex], rootWin, 0,0, &rootX, &rootY, &tmp);
-            
-            //printf("width: %d, height: %d, x: %d, y: %d\n", attr.width, attr.height, attr.x, attr.y);
+            XTranslateCoordinates(dpy, children[checkIndex], rootWin, 0,0, &rootX, &rootY, &tmp);
 
-            XRenderPictFormat* format = XRenderFindVisualFormat(mainDspy, attr.visual);
-            Pixmap p = XCompositeNameWindowPixmap(mainDspy, children[checkIndex]);
+            Pixmap p = XCompositeNameWindowPixmap(dpy, children[checkIndex]);
+            XRenderPictFormat* fmt = XRenderFindVisualFormat(dpy, attr.visual);
 
             meta[openIndex].win = tmp;
-            meta[openIndex].fmt = format;
             meta[openIndex].pix = p;
+            meta[openIndex].fmt = fmt;
             meta[openIndex].x = rootX;
             meta[openIndex].y = rootY;
             meta[openIndex].w = attr.width;
@@ -129,39 +116,45 @@ XImage* getScreenshotPixmap1234(Display* mainDspy, Window rootWin, Window mainWi
     }
     openIndex--;
 
-    //Pixmap finalPixmap = XCreatePixmap(mainDspy, rootWin, DisplayWidth(mainDspy, defaultScreen), DisplayHeight(mainDspy, defaultScreen), DefaultDepth(mainDspy, defaultScreen));
-
-    //XRenderPictureAttributes pa;
-    //Picture finalPic = XRenderCreatePicture(mainDspy, finalPixmap, XRenderFindVisualFormat(mainDspy, DefaultVisual(mainDspy, defaultScreen)), 0, &pa);
-
-
-    //loop over all windows and composite them into one picture
+    // composite all windows into finalPixmap
     for (int i = 0; i < openIndex; i++) {
-        Picture someWindow;
-        someWindow = XRenderCreatePicture(mainDspy, meta[i].pix, meta[i].fmt, 0, NULL);
-        XRenderComposite(mainDspy, PictOpOver, someWindow, None, finalPic, 0,0, 0,0, meta[i].x,meta[i].y, meta[i].w, meta[i].h);
-        XRenderFreePicture(mainDspy, someWindow);
+        Picture pic = XRenderCreatePicture(dpy, meta[i].pix, meta[i].fmt, 0, NULL);
+        XRenderComposite(dpy, PictOpOver, pic, None, finalPic,
+                         0,0,0,0, meta[i].x, meta[i].y, meta[i].w, meta[i].h);
+        XRenderFreePicture(dpy, pic);
     }
-    
 
-    
-
-    XImage* img = XGetImage(mainDspy, finalPixmap, 0,0, DisplayWidth(mainDspy, defaultScreen), DisplayHeight(mainDspy, defaultScreen), AllPlanes, ZPixmap);
-
-    // copy pixels into a new XImage with malloc'd data
-    XImage* copy = XCreateImage(mainDspy, DefaultVisual(mainDspy, defaultScreen), img->depth, ZPixmap, 0,
-                                (char*)malloc(img->bytes_per_line * img->height),
-                                img->width, img->height, img->bitmap_pad, img->bytes_per_line);
-
-    memcpy(copy->data, img->data, img->bytes_per_line * img->height);
-
-    XDestroyImage(img);
+    free(meta);
     XFree(children);
-    free(openedWindows);
-    free(formats);
 
-    return copy;
-    
+    // create shared memory XImage if not already
+    if (!(*shmImgPtr)) {
+        *shmImgPtr = XShmCreateImage(dpy,
+                                     DefaultVisual(dpy, defaultScreen),
+                                     DefaultDepth(dpy, defaultScreen),
+                                     ZPixmap,
+                                     NULL,
+                                     shminfo,
+                                     DisplayWidth(dpy, defaultScreen),
+                                     DisplayHeight(dpy, defaultScreen));
+
+        shminfo->shmid = shmget(IPC_PRIVATE,
+                                (*shmImgPtr)->bytes_per_line * (*shmImgPtr)->height,
+                                IPC_CREAT | 0777);
+        shminfo->shmaddr = shmat(shminfo->shmid, 0, 0);
+        (*shmImgPtr)->data = shminfo->shmaddr;
+        shminfo->readOnly = False;
+
+        if (!XShmAttach(dpy, shminfo)) {
+            fprintf(stderr, "XShmAttach failed\n");
+            exit(1);
+        }
+    }
+
+    // get the image from finalPixmap into shared memory
+    XShmGetImage(dpy, finalPixmap, *shmImgPtr, 0, 0, AllPlanes);
+
+    return *shmImgPtr;
 }
 
 
@@ -185,7 +178,7 @@ int main() {
     int eventBase, errorBase;
     XCompositeQueryExtension(mainDisplay, &eventBase, &errorBase);
 
-    //get all the windows except mine
+    
 
     XGetWindowAttributes(mainDisplay, mainWindow, &wa);
     XImage* img;
@@ -201,19 +194,25 @@ int main() {
 
 
     
-    for (;;) {// main looooooooooooooooooop!!!!!
-        img = getScreenshotPixmap1234(mainDisplay, rootWindow, mainWindow, finalPixmap, finalPic);
+    XShmSegmentInfo shminfo;
+    XImage* shmImg = NULL;
+
+    for (;;) {//main loooooooop!!!
+        img = getScreenshotPixmap1234(mainDisplay, rootWindow, mainWindow,
+                                    finalPixmap, finalPic,
+                                    &shminfo, &shmImg);
 
         XGetWindowAttributes(mainDisplay, mainWindow, &wa);
+
         int winX, winY;
         Window child;
         XTranslateCoordinates(mainDisplay, mainWindow, rootWindow, 0, 0, &winX, &winY, &child);
-        
-        XPutImage(mainDisplay, mainWindow, gc, img, winX, winY, 0,0, wa.width, wa.height);
-        XDestroyImage(img);
+
+        XShmPutImage(mainDisplay, mainWindow, gc, shmImg,
+                    winX, winY, 0, 0, wa.width, wa.height, False);
+        XSync(mainDisplay, True);
 
         getStats(&timing);
-
     }
 
 
