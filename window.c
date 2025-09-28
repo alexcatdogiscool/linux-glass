@@ -12,6 +12,7 @@
 #include <X11/extensions/XShm.h>
 #include <sys/shm.h>
 #include <sys/ipc.h>
+#include <X11/extensions/Xdamage.h>
 
 
 typedef struct WinMeta {
@@ -178,6 +179,10 @@ int main() {
     int eventBase, errorBase;
     XCompositeQueryExtension(mainDisplay, &eventBase, &errorBase);
 
+    int damage_event, damage_error;
+    XDamageQueryExtension(mainDisplay, &damage_event, &damage_error);
+    int* dmgWindows = NULL;
+
     
 
     XGetWindowAttributes(mainDisplay, mainWindow, &wa);
@@ -192,15 +197,24 @@ int main() {
     XRenderPictureAttributes pa;
     Picture finalPic = XRenderCreatePicture(mainDisplay, finalPixmap, XRenderFindVisualFormat(mainDisplay, DefaultVisual(mainDisplay, defaultScreen)), 0, &pa);
 
+    // for passive frame update even when nothing is happening.
+    struct timeval passive1, passive2;
+    gettimeofday(&passive1, NULL);
+    gettimeofday(&passive2, NULL);
+    
 
     
     XShmSegmentInfo shminfo;
     XImage* shmImg = NULL;
 
+    img = getScreenshotPixmap1234(mainDisplay, rootWindow, mainWindow,
+                                finalPixmap, finalPic,
+                                &shminfo, &shmImg);
+
     for (;;) {//main loooooooop!!!
-        img = getScreenshotPixmap1234(mainDisplay, rootWindow, mainWindow,
-                                    finalPixmap, finalPic,
-                                    &shminfo, &shmImg);
+        //img = getScreenshotPixmap1234(mainDisplay, rootWindow, mainWindow,
+          //                          finalPixmap, finalPic,
+            //                        &shminfo, &shmImg);
 
         XGetWindowAttributes(mainDisplay, mainWindow, &wa);
 
@@ -213,6 +227,15 @@ int main() {
         XSync(mainDisplay, True);
 
         getStats(&timing);
+
+        gettimeofday(&passive1, NULL);// passive frame update
+        if (abs((int)(passive1.tv_usec - passive2.tv_usec)) >= 100000) {//update every 100 ms
+            gettimeofday(&passive1, NULL);
+            gettimeofday(&passive2, NULL);
+            img = getScreenshotPixmap1234(mainDisplay, rootWindow, mainWindow,
+                                      finalPixmap, finalPic,
+                                      &shminfo, &shmImg);
+        }
     }
 
 
